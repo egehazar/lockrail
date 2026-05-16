@@ -183,3 +183,44 @@ For a tool-call middleware, request fan-out is modest — most calls are
 serial within an agent run. 10 base + 20 overflow gives us 30 concurrent
 DB connections, plenty for the eval workload (single-process, ~10
 parallel scenarios max). In prod we'd tune based on load.
+
+## Step 7 — Idempotency + audit persistence: first working slice
+
+### Why the IdempotencyGate signals via metadata, not a new GateDecision
+We could have added a `CACHE_HIT` decision to the enum, but that contaminates
+the gate vocabulary. Every other decision is about *should this proceed* —
+ALLOW/DENY/REQUIRE_APPROVAL/SKIP. Cache hit isn't a decision, it's a
+side-channel signal saying "the answer already exists, runtime please use it."
+Using `ctx.metadata` keeps the decision enum clean and makes the short-
+circuit logic visible in one place (Runtime._finalize) instead of scattered.
+
+### Why only EXECUTED results are cached
+- BLOCKED: re-evaluate next time, the policy might have changed
+- PENDING_APPROVAL: waiting on a human; caching means future calls skip
+  the approval, defeating the point
+- FAILED: transient errors should let the agent retry
+- REPLAYED: already cached upstream
+
+Only deterministic, successful executions go into the cache.
+
+### Why audit write failures don't fail the transaction
+The runtime's job is to make a safe decision and execute. If the audit
+write fails (DB blip, network glitch), the transaction itself was still
+correct — the side effect already happened or was correctly blocked. Failing
+the transaction because of a logging issue would mean *more* unsafe writes,
+not fewer. We log loudly and continue; in prod we'd alert on this metric.
+
+### Why `_persist` uses its own session via session_factory
+The runtime is invoked from many contexts (MCP middleware, FastAPI route,
+test). Threading an `AsyncSession` through every layer would couple the
+runtime to whatever HTTP framework is on top. The session_factory pattern
+means: "give me something that produces a session when I need one." Each
+transaction owns its session lifecycle.
+
+### Where the 95% duplicate-prevention metric comes from
+Webhook replay test: fire the same event N times, count distinct executor
+invocations. With IdempotencyGate in place, the executor sees the first
+event only; the other N-1 are REPLAYED. So duplicate prevention is
+(N-1)/N. The 95% figure assumes a few legitimate retries that arrive
+with subtle arg differences (e.g. different retry_id) — those bypass the
+cache. We'll quantify this in the eval suite (Step 12).
