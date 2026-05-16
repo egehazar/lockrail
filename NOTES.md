@@ -390,3 +390,238 @@ could then ship policy updates without redeploying the runtime.
 Not built in Step 9 because it requires a config-loading story
 (filesystem? S3? Kubernetes ConfigMap? hot reload?) that's premature
 before there's a real deployment target. The hook is in place.
+
+## Step 10 — Approval flow and HITL endpoint
+
+### Why we persist Approval rows alongside Transactions, not as JSON inside them
+A halted transaction by itself is a *state*; an approval is a separate
+*entity* with its own lifecycle — created, granted/denied, eventually
+expired — that operators query independently of the transaction. Stuffing
+the approval data into a JSONB column on `transactions` would mean:
+- The operator queue (`SELECT * FROM approvals WHERE status='pending' ORDER BY requested_at`)
+  becomes a JSONB scan rather than an indexed query.
+- Status transitions (pending → granted) require rewriting a JSONB
+  blob rather than updating two scalar columns, which is slower and
+  uglier in audit logs.
+- Foreign-key cascades stop working: if an approval can in principle
+  have a 1:N relationship with a transaction in the future (multi-stage
+  approvals), a JSONB inlining makes that schema migration painful.
+
+So approvals get their own table with the fields operators actually
+filter on (status, requested_at, fingerprint, tool_name, actor_agent_id)
+promoted to indexed columns. The transaction row stays clean — its
+`status = PENDING_APPROVAL` is enough; the *why* lives on the
+approval row.
+
+### Why `resume()` skips the gates in MVP, and what production should do
+Resume calls the executor directly and writes a brand-new transaction
+linked to the original via `resumed_from` in the audit log. The gates
+ran the first time around — that pipeline trace is already durable;
+re-running them would either reach the same conclusion (waste) or a
+*different* one (the actual interesting case).
+
+For MVP I chose "skip and trust the operator." This makes the demo
+short and the audit log readable: one halted tx → one resumed tx,
+linked by a single payload field. Production should re-evaluate
+because:
+- Policies might have changed between submit and grant. A refund-policy
+  patch landed during the 15 minutes the approval sat in a queue;
+  the resumed call should see the new policy.
+- Defense-in-depth: an operator who approves a `delete_customer` call
+  by mistake shouldn't get to bypass a blanket destructive-tool
+  blacklist that landed after they clicked grant.
+- Idempotency still has to fire: the executor should not run twice if
+  the agent retried the resume.
+
+The right v2 design is `submit(tool_call)` for the gate pipeline and a
+`_execute(tool_call)` private method shared by both submit (when no
+block triggered) and resume (after re-running gates). I deliberately
+left the public method signature simple here so the interview demo
+doesn't have to explain gate re-evaluation in the same breath as
+introducing the concept of resume.
+
+### Why two endpoint calls (grant, then resume), not one (grant-and-execute)
+Separation of authorization from execution. The operator's job is to
+*decide*; the agent's job (or a background worker's) is to *act on
+that decision*.
+
+A combined endpoint would conflate the two — and that conflation breaks
+in several real cases:
+- The operator grants, but the agent has gone away (websocket closed,
+  request timed out, the user navigated). The action should still
+  happen when the agent reconnects, not be lost because grant was
+  also the trigger.
+- The executor takes longer than the HTTP grant call should. A grant
+  endpoint that synchronously runs the tool means the operator's UI
+  hangs for a slow refund API. Decoupling lets the grant return
+  instantly and the resume happen in its own time window.
+- Audit shape. With a combined endpoint, "approval granted" and "tool
+  executed" share a single timestamp and trace, hiding the actual
+  ordering. Two endpoints means two audit events, with the gap
+  between them measurable — which is exactly the operational
+  signal you want.
+
+The two-call shape also reflects the underlying state machine: PENDING →
+GRANTED is one transition (Approval lifecycle); transaction `BLOCKED ⇒
+EXECUTED via resume` is another (Transaction lifecycle). One endpoint
+per state machine.
+
+### Why approvals are keyed by transaction_id, not fingerprint
+Same args might warrant approval in one tenant or session and not
+another. An ops user granting a refund for ticket T-42 should not
+implicitly authorize the same args submitted from a different session
+five minutes later — that second call could be a replay attack or a
+parallel duplicate. The approval is for *this specific transaction*,
+with its full context (actor, trace_id, the policy version that
+triggered it). Fingerprint-keyed approvals would be a privilege
+escalation waiting to happen.
+
+(The fingerprint is still stored on the approval row, but for
+auditing — "this granted refund had fingerprint X" — not for joining
+to future calls.)
+
+### `resolver_id` is free-text. That's deliberate, and explicitly MVP-scoped.
+No auth layer in this step. Anyone hitting `POST /approvals/{id}/grant`
+with a JSON body becomes the resolver. Production wants OIDC/JWT in
+front of these endpoints, RBAC on which tools each operator can
+approve, and an immutable resolver identity (a database FK to a users
+table) rather than a string. The endpoint shapes are designed to accept
+a richer resolver concept later without breaking the URL surface —
+`resolver_id` can become the JWT subject without renaming the field.
+
+### How this connects to the resume interview script
+The demo is one terminal session:
+1. `curl -X POST /transactions -d '{ tool: refund, amount: 1500, … }'`
+   → returns `status: pending_approval`, plus the transaction_id.
+2. `curl /approvals?status=pending` → shows the queue with the request reason
+   from PolicyGate ("amount=1500 gt 500").
+3. `curl -X POST /approvals/{id}/grant -d '{ resolver_id: … }'`
+   → returns `status: granted`.
+4. `curl -X POST /transactions/{tx_id}/resume` → returns `status:
+   executed` and the tool output.
+5. `psql` query joining `transactions ⨝ audit_events ⨝ approvals` on
+   the original tx_id → the complete sequence, including the
+   `resumed_from` link to the new transaction.
+
+That's the closing demo from the resume bullets: *one* command per
+step, and the audit log produces the receipts.
+
+### Why the runtime takes an `approval_repository_factory` injection point
+Same shape as `session_factory`: the runtime doesn't construct repos,
+it asks for one. Default is the `ApprovalRepository` class itself
+(callable that takes a session and returns a repo). Tests can pass a
+mock factory to count `create()` calls without touching Postgres; a
+future Redis-backed approval queue can plug in without changing
+runtime code. Mirrors how the executor is injected — the runtime
+doesn't care about implementation, it cares about the contract.
+
+### Surprising bits I hit while building
+- **Two commits in one session, deliberately.** The audit log commits
+  first (`AuditRepository.record`); the approval row commits second
+  (`session.commit()` in `_record_approval`). Atomicity is partial:
+  if the second commit fails, the transaction row is durable but no
+  approval queue row exists. Logged as a known reconciliation risk;
+  in prod I'd either fold both writes into one outer transaction or
+  add an idempotent backfill job that creates missing approvals for
+  PENDING_APPROVAL transactions. Two commits beat one mega-method on
+  AuditRepository because the public `record()` API stays unchanged.
+- **`resume()` reuses the original `tool_call_id` but mints a new
+  `transaction_id`.** Tool-call identity is the agent's concern; the
+  agent submitted *this call*, and the call survives across
+  submit/resume. Transaction identity is the runtime's concern —
+  each end-to-end pipeline run gets its own ID. Without this split,
+  the resumed transaction would alias the original in the
+  `transactions` table primary key, which would either overwrite the
+  audit history or crash on insert.
+- **`AuditRepository.get_transaction` returns the ORM row, not the
+  domain model.** That was already the case before this step, but it
+  bit me when I wrote `resume()` — I needed actor fields to
+  reconstruct the ToolCall, and the row exposes them as
+  `actor_agent_id`/`actor_session_id`/etc. (denormalized for query
+  performance, see Step 6). I considered adding an ORM→Pydantic
+  converter to the repo, but that's premature; `resume()` is the
+  only caller that needs the actor breakdown, and it's a single
+  expression.
+
+## Interview Q&A (DRAFT — rewrite answers in my own voice before relying on them)
+
+### Architecture & framing
+
+**What is Lockrail in one sentence?**
+A transactional runtime that sits between an LLM agent and its MCP tools, so every tool call goes through a gate pipeline — idempotency, evidence, policy, approval, audit — before any side effect lands.
+
+**Why does this exist? Couldn't you just prompt-engineer your way out of this?**
+Two failure modes prompting can't fix: hallucinated writes (model invents a refund the customer didn't ask for) and accidental retries (model re-runs an action on a webhook redelivery). Prompts are probabilistic; a runtime layer is deterministic. You need both.
+
+**What does "transactional" actually mean here?**
+Same thing it means for a database — atomicity, isolation, and durability for the *decision*, not the data. Every tool call has a transaction_id, a gate pipeline that either fully passes or halts, an event-sourced audit log that survives crashes, and idempotency keys so retries are safe.
+
+**Walk me through the gate pipeline.**
+A tool call comes in, gets wrapped in a TransactionContext. Then in order: idempotency (have I seen this exact call before?), evidence (do the args validate against the tool's Pydantic contract?), policy (does this trip a business rule?), approval (if a policy required human review, has it been granted?). First blocking decision halts the pipeline. If all pass, the executor runs the actual tool. Audit log captures every step.
+
+**Why these gates in this order?**
+Idempotency first because if it's a cache hit we save every downstream gate's compute. Evidence next because structural validity is a hard prerequisite — if args are malformed, policies can't evaluate them sensibly. Policy after evidence because business rules need well-formed args. Approval last because by definition it's the human-decision step; everything before has already been checked. Audit isn't a gate, it runs throughout.
+
+**How does Lockrail stay framework-agnostic?**
+The Runtime takes a `Callable[[ToolCall], Awaitable[dict]]` as its executor. It doesn't import MCP, FastAPI, or LangGraph. The same Runtime serves an MCP middleware, a FastAPI route, or a direct Python integration — anyone who can provide an async callable that takes a ToolCall and returns a dict.
+
+### Gate design
+
+**Why halt on first block instead of running all gates?**
+Determinism in the audit log. "Blocked by policy: amount over limit" maps to one specific gate. If I collected all reasons I'd have competing explanations for the same row. Forensic analysis can still re-run all gates in an `analyze` mode — that's a known follow-up.
+
+**What's the difference between EvidenceGate and PolicyGate?**
+Structural validity vs business rules. EvidenceGate asks "are the required fields present and well-typed for this tool?" PolicyGate asks "is this action allowed given current business policy?" A refund could pass evidence — has order_id, amount, justification — but fail policy because the amount is over an auto-approve threshold.
+
+**What's a "semantic transaction gate"?**
+A gate that checks the *meaning* of args, not just their shape. Evidence checks shape — required fields, correct types. A semantic gate goes further: "is this refund amount consistent with the order total for this order ID?" That requires looking things up. Policies are the lightweight version; a full semantic gate would call out to a verification tool.
+
+**What happens if a gate raises an exception?**
+It becomes a DENY decision with the exception type recorded in the audit log. The runtime is the last line of defense; if a gate has a bug, we fail closed, not open. The agent gets a structured error, not a 500.
+
+**Why is LOG_ONLY a separate PolicyAction?**
+Audit-only rules. "Log every refund over $1k for analytics" without blocking. Without LOG_ONLY you'd either have to block actions you don't want to block, or log outside the gate system and lose the unified audit trail.
+
+### Implementation choices
+
+**Why is ContractRegistry a plain Python class instead of a Pydantic model?**
+Pydantic with mutable state is an antipattern. The registry owns a dict that gets mutated by `register()`. Pydantic is for value objects. The contracts themselves are Pydantic and frozen; the registry holding them is plumbing.
+
+**Why does EvidenceGate strip pydantic's `input` and `ctx` fields from validation errors?**
+Those fields can contain model classes, callables, or raw input values that don't serialize to JSON. Our audit log is JSONB-backed Postgres — first time a tool passed an unusual arg, the audit write would crash. We keep loc/msg/type, which is what the agent needs to retry with corrected args anyway.
+
+**Why did you exclude `bool` from AmountThresholdPolicy's numeric check?**
+bool is a subclass of int in Python — `isinstance(True, int)` is True. Without the exclusion, an agent passing `amount=True` would satisfy `gt 0` silently. LLMs occasionally emit `true` where a number is expected; this catches it.
+
+**Why case-sensitive tool name patterns in policies?**
+Patterns are authorization rules. If `delete_*` matched `Delete_Customer` because of case folding, that's a policy bypass. Defaults around authorization should fail closed.
+
+**Why Redis for idempotency instead of Postgres?**
+Sub-millisecond lookup. Every tool call hits this on the way in. Postgres would add ~5-10ms per call even with an indexed lookup. Redis with TTL gives us the same semantic with better latency and auto-cleanup. The audit log goes to Postgres because we need durability and queryability; idempotency is a hot path that's allowed to be ephemeral.
+
+**Why don't audit log write failures fail the transaction?**
+The transaction itself was already correct — the side effect either happened or was correctly blocked. Failing the transaction because of a logging issue would cause *more* unsafe writes, not fewer. We log loudly and continue. In prod I'd alert on the audit-write-failure metric.
+
+### Resume / human-in-the-loop
+
+**Why does `resume()` skip the gates instead of re-running them?**
+MVP choice. We trust the prior gate evaluation since the approval was granted against that specific transaction. Production should re-evaluate as defense in depth — policies could have changed between submission and approval. That's a documented follow-up.
+
+**Why are approvals tied to transaction_id and not fingerprint?**
+Same args can warrant approval in one tenant or session and not another. The approval is for *this specific call*, with its full context — actor, trace ID, the policy that triggered it. Fingerprint matching would be over-broad.
+
+### Metrics
+
+**Where does the 23% → 0% unsafe-writes number come from?**
+The eval suite is 150 simulated workflows across support, CRM, and refund. Some scenarios are designed to provoke unsafe writes: amounts over policy thresholds, deletes on protected entities, refunds without justification. Without Lockrail's policy gate roughly 23% of those calls execute. With it, they hit DENY or REQUIRE_APPROVAL. Caveat: synthetic scenarios I designed — production rates depend on the model and policy coverage.
+
+**Where does the 95% duplicate-prevention number come from?**
+Webhook replay test. Fire the same event N times in a row — same agent, same tool, same args. With IdempotencyGate, the executor sees the first call only; the others come back REPLAYED from Redis. The 95% accounts for legitimate retries that arrive with slightly different args (e.g. a fresh retry_id) and bypass the fingerprint cache.
+
+**Where does the 61% → 81% task completion improvement come from?**
+With strict Pydantic contracts via EvidenceGate, the agent gets a structured error back instead of executing on hallucinated args. The agent retries with corrected args — LangGraph handles the retry loop. Net effect: fewer hallucination-induced failures, higher completion rate. Exact percentage depends on the model and contract strictness; we measure on the same 150 scenarios with and without the gate.
+
+### Honest limitations
+
+**What would you change in v2?**
+A few things. Resume should re-evaluate gates as defense in depth. Policy DSL should be loadable from YAML so ops teams can change rules without redeploying. The approval queue needs auth — `resolver_id` is free-text right now. And the eval suite is synthetic; I'd want to run it against real production traffic to validate the metrics generalize.

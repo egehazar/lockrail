@@ -17,6 +17,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PgUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from ..models.approval import ApprovalStatus
 from ..models.audit import AuditEventType
 from ..models.transaction import TransactionStatus
 from .db import Base
@@ -87,3 +88,35 @@ class AuditEventRow(Base):
         # within a transaction even under clock skew.
         Index("ix_audit_tx_sequence", "transaction_id", "sequence_num", unique=True),
     )
+
+
+class ApprovalRow(Base):
+    """Persistent HITL approval queue row.
+
+    One row per halted transaction. The queryable status column drives
+    operator dashboards; the transaction_id FK lets us join back for the
+    full audit trail. Cascading delete: if the transaction is purged, the
+    approval goes with it.
+    """
+    __tablename__ = "approvals"
+
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True)
+    transaction_id: Mapped[UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("transactions.transaction_id", ondelete="CASCADE"),
+        index=True,
+    )
+    fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    tool_name: Mapped[str] = mapped_column(String(255), index=True)
+    actor_agent_id: Mapped[str] = mapped_column(String(255), index=True)
+    requested_reason: Mapped[str] = mapped_column(String)
+    status: Mapped[ApprovalStatus] = mapped_column(
+        SAEnum(ApprovalStatus, name="approval_status"),
+        index=True,
+    )
+    requested_at: Mapped[datetime] = mapped_column(index=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    resolver_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    notes: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    transaction: Mapped[TransactionRow] = relationship()

@@ -1,4 +1,5 @@
 """Lockrail domain models."""
+from .approval import Approval, ApprovalStatus
 from .audit import AuditEvent, AuditEventType
 from .gate import GateDecision, GateResult
 from .policy import (
@@ -22,6 +23,8 @@ from .transaction import (
 __all__ = [
     "Actor",
     "AmountThresholdPolicy",
+    "Approval",
+    "ApprovalStatus",
     "ArgEqualsPolicy",
     "AuditEvent",
     "AuditEventType",
