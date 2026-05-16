@@ -1,0 +1,34 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: lockrail-postgres
+    environment:
+      POSTGRES_USER: lockrail
+      POSTGRES_PASSWORD: lockrail
+      POSTGRES_DB: lockrail
+    ports:
+      - "5432:5432"
+    volumes:
+      - lockrail_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lockrail"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: lockrail-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - lockrail_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  lockrail_pgdata:
+  lockrail_redisdata:

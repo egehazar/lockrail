@@ -3,4 +3,36 @@ name = "lockrail"
 version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "alembic>=1.18.4",
+    "anthropic>=0.102.0",
+    "fastapi[standard]>=0.136.1",
+    "httpx>=0.28.1",
+    "langfuse>=4.6.1",
+    "langgraph>=1.2.0",
+    "mcp>=1.27.1",
+    "openai>=2.37.0",
+    "opentelemetry-api>=1.39.1",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.39.1",
+    "opentelemetry-instrumentation-fastapi>=0.60b1",
+    "opentelemetry-instrumentation-sqlalchemy>=0.60b1",
+    "opentelemetry-sdk>=1.39.1",
+    "psycopg[binary,pool]>=3.3.4",
+    "pydantic>=2.13.4",
+    "pydantic-ai>=1.97.0",
+    "pydantic-settings>=2.14.1",
+    "python-dotenv>=1.2.2",
+    "redis>=7.4.0",
+    "sqlalchemy[asyncio]>=2.0.49",
+    "structlog>=25.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "faker>=40.18.0",
+    "mypy>=2.1.0",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.13",
+]
