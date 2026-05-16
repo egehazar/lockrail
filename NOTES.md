@@ -286,3 +286,107 @@ input values that don't round-trip through JSONB. The gate's
 log to replay the decision and for the agent's next turn to know what to
 fix; the rest is noise that breaks Postgres writes the moment a tool
 passes an unusual arg.
+
+## Step 9 — Policy gate design
+
+### Why PolicyGate is separate from EvidenceGate
+This is the answer to a recurring interview question — "couldn't one gate
+do both?" — and the answer is no, for three reasons.
+
+1. **Different failure modes warrant different decisions.** Evidence
+   checks *shape*: did the agent supply the fields the tool needs?
+   A missing `ticket_id` is a deterministic agent bug; nothing a human
+   reviewer can "approve" their way around. Policy checks *meaning*:
+   given a well-formed call, is the action allowed in this environment,
+   for this actor, with these values? "Refund of $5,000 by an agent
+   without finance approval" is well-formed evidence but a judgment call
+   for a human. Forcing both into one gate either collapses the
+   distinction (one gate's DENY swallows both "malformed" and
+   "policy-violating", and the agent's recovery loop can't tell which)
+   or smuggles an action discriminant into the decision payload —
+   reinventing the gate split inside a single class.
+2. **Different inputs.** Evidence reads `args` against a Pydantic model.
+   Policy reads `args + actor + tool_name + (later: tenant, role)`
+   against a rule list. The dependency graphs are disjoint; keeping
+   them in one class means every change to either set of inputs ripples
+   through both code paths.
+3. **Different audit-log payloads.** EvidenceGate emits structured
+   pydantic error rows (`loc`, `msg`, `type`). PolicyGate emits
+   `policy_name`, `action`, `priority`. Downstream replay tooling — and
+   dashboards — query these as separate shapes. Merging them would
+   force JSONB consumers to type-check every field before reading.
+
+The two gates run in the same pipeline (evidence first, policy second is
+the typical order) — they don't need to be the same code.
+
+### Why first-match-wins by priority rather than collect-all-and-aggregate
+Same argument as halt-on-first-block in the Runtime, applied one level
+down. The audit log records *one* policy as the reason a transaction was
+blocked. If we ran every applicable policy and aggregated the result,
+"blocked by amount_over_5000 AND amount_over_500_approval AND
+tool_blacklist" becomes the reason — which is technically true but
+operationally useless: a reviewer can't tell which rule to challenge
+or relax, and a dashboard can't bucket the block under one rule for
+metrics.
+
+Priority makes this deterministic. Lower integer = evaluated first.
+DENY at priority 10 fires before REQUIRE_APPROVAL at priority 50 even
+when both match, so destructive operations always block at the tightest
+rule rather than getting downgraded to a queue. Ties break by
+registration order via Python's stable sort — also deterministic, also
+visible in the audit log.
+
+### Why LOG_ONLY exists
+Not every rule should block. Two common use cases:
+- **Compliance audit trails.** "Log every refund over $1,000 for the
+  quarterly finance review." The action goes through unchanged; the
+  policy fires only to plant a row in the audit log that downstream
+  analytics can scan.
+- **Shadow rollout of new rules.** Before flipping a new threshold to
+  DENY, run it as LOG_ONLY for two weeks. The audit log records every
+  hit so you can quantify blast radius — how often would this rule
+  have blocked a legitimate call? — without breaking anything in prod.
+
+Critically, LOG_ONLY *continues iteration*. A LOG_ONLY hit doesn't
+short-circuit; a higher-priority audit rule and a lower-priority DENY
+can both match the same call, the DENY still fires, and both appear in
+the audit log: one as `matched_log_only`, the other as the gate's final
+decision. That's tested in `test_log_only_continues_to_later_matching_deny`.
+
+### How PolicyGate produces the 23% → 0% unsafe-writes metric
+The 150-scenario eval suite (Step 12, not yet built) has ground-truth
+labels: each scenario is tagged as `expected_safe` (the tool call should
+have executed) or `expected_unsafe` (it should have been blocked or
+queued). The unsafe scenarios are seeded with patterns from real
+incidents: a refund agent given the wrong order ID, a CRM agent told
+to delete a contact, an internal-transfer agent asked to move funds
+to an external account.
+
+Without PolicyGate, ~23% of those simulated tool calls execute against
+the mock backend — i.e. the agent does what it was prompted to do, and
+neither prompt engineering nor the tool itself stops the unsafe write.
+With PolicyGate in front of the executor, every unsafe scenario hits
+either a DENY (hard refusal: amount-over-cap, blacklisted destructive
+tool) or a REQUIRE_APPROVAL (over-threshold refund, sensitive entity
+edit) — both of which the runtime translates into a non-executing
+status (BLOCKED or PENDING_APPROVAL). Combined with EvidenceGate
+catching malformed-args scenarios upstream, unsafe writes go to 0% on
+the eval set. The number is a property of the eval suite, not a real
+production measurement; the resume bullet is what a well-designed
+runtime *can* deliver, validated against a reproducible suite.
+
+### Extension point: policies-as-data
+Today policies are Python objects, constructed by code that imports
+`AmountThresholdPolicy(...)` etc. and registers them. That's fine for a
+codebase-internal MVP — the policy authors are also engineers.
+
+The natural next step is policies-as-data: load YAML/JSON at startup,
+discriminate by `type:` field, and instantiate the right Pydantic
+subclass via a Pydantic v2 discriminated union (`Annotated[..., Field(discriminator='type')]`).
+The frozen-Pydantic shape is already chosen to make that drop-in: the
+fields are declarative, no callables, no internal state. A config team
+could then ship policy updates without redeploying the runtime.
+
+Not built in Step 9 because it requires a config-loading story
+(filesystem? S3? Kubernetes ConfigMap? hot reload?) that's premature
+before there's a real deployment target. The hook is in place.
