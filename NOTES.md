@@ -141,3 +141,45 @@ Audit persistence requires storage (Postgres). Step 5 is in-memory only;
 gate decisions accumulate in `TransactionContext.gate_results` and end up
 in the final `TransactionResult`. Step 6 adds the audit repository and
 wires audit emission into the runtime as a side effect of each gate run.
+
+## Step 6 — Storage layer design
+
+### Why two tables, not one big audit log
+- `transactions`: one row per submitted tool call. Summary state, the
+  row you'd show in a dashboard. Indexed by actor, tool, fingerprint,
+  status, start time.
+- `audit_events`: many rows per transaction. Append-only event stream
+  forming the replayable trace. Indexed by transaction_id + sequence_num
+  (unique together).
+
+A single denormalized log would mean every dashboard query joins through
+a huge table. Splitting summary from stream gives us O(1) status lookup
+and a separate optimized scan path for forensic replay.
+
+### Why denormalize Actor fields onto TransactionRow
+Storing actor as JSONB would make "transactions by agent X" a JSONB-path
+query — slow even with GIN indexes, awkward for analytics. Promoting
+agent_id, session_id, user_id, tenant_id to indexed columns costs 4
+columns and buys us first-class query performance.
+
+### Why `JSONB` instead of `JSON`
+JSONB stores parsed binary form. Operations (key existence, containment,
+indexing) are 10–100x faster on JSONB. There's a small write cost for
+the parse, but our audit-log workload is write-once, read-many.
+
+### Why `(transaction_id, sequence_num)` is a unique index
+Sequence numbers guarantee total order within a transaction even when
+clock skew makes timestamps tie. Making the index unique means replay
+can never see two events claiming the same position — protects us from
+double-emit bugs in upstream code.
+
+### Why Alembic env.py reads `Settings.database_url`
+If alembic.ini and the running app drift in their DB URL, migrations
+land on the wrong DB. Reading from Settings means there's one source of
+truth: change the `.env`, both move together.
+
+### Why pool_size=10, max_overflow=20
+For a tool-call middleware, request fan-out is modest — most calls are
+serial within an agent run. 10 base + 20 overflow gives us 30 concurrent
+DB connections, plenty for the eval workload (single-process, ~10
+parallel scenarios max). In prod we'd tune based on load.
