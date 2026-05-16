@@ -100,3 +100,44 @@ when it has nothing to say, polluting the audit log with noise.
 Timestamps collide at sub-millisecond resolution under load. Sequence numbers
 guarantee total order within a transaction, regardless of clock skew. The
 replay engine sorts by (transaction_id, sequence_num), never by timestamp.
+
+## Step 5 — Gate abstraction and runtime design
+
+### Why a base `Gate` ABC with `_evaluate` + public `run`
+Template method pattern. Every gate needs the same plumbing: time itself,
+catch exceptions, build a `GateResult`. Forcing each gate to handle this
+manually would mean inconsistent error semantics across gates — exactly
+the bug Lockrail is supposed to prevent in the agent it wraps. The ABC
+guarantees every gate produces a well-formed `GateResult` even when it
+crashes.
+
+### Why exceptions become DENY, not propagate
+The runtime is the last line of defense. If a gate has a bug and throws,
+the safe default is to block the action, not let an unrelated stack trace
+crash the orchestrator and potentially fail-open. This is one of the
+"design-level coordination failures" Lockrail prevents: a misbehaving
+component should fail closed.
+
+### Why halt-on-first-block instead of running all gates
+- **Determinism**: "blocked by policy" maps to one specific gate, not a
+  set of competing reasons. This makes the audit log unambiguous.
+- **Performance**: gates that hit Redis or Postgres have latency; running
+  all of them when the first denies is waste.
+- **Counterpoint**: for forensic analysis you sometimes want to see
+  *everything* that would have blocked. Solution for later: an `analyze`
+  mode that runs every gate regardless. Not in MVP.
+
+### Why the runtime takes an opaque `executor` callable
+Lockrail is framework-agnostic. The runtime doesn't import MCP, FastAPI,
+or LangGraph. It only knows `ToolCall in → TransactionResult out`. The
+executor is a `Callable[[ToolCall], Awaitable[dict]]` injected by whoever
+wires Lockrail into a real system. Same runtime serves:
+- MCP middleware (executor = MCP client.call_tool)
+- FastAPI tool routes (executor = call internal handler)
+- Tests (executor = mock dict)
+
+### Why `Runtime` doesn't write audit events yet
+Audit persistence requires storage (Postgres). Step 5 is in-memory only;
+gate decisions accumulate in `TransactionContext.gate_results` and end up
+in the final `TransactionResult`. Step 6 adds the audit repository and
+wires audit emission into the runtime as a side effect of each gate run.
