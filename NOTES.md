@@ -224,3 +224,65 @@ event only; the other N-1 are REPLAYED. So duplicate prevention is
 (N-1)/N. The 95% figure assumes a few legitimate retries that arrive
 with subtle arg differences (e.g. different retry_id) — those bypass the
 cache. We'll quantify this in the eval suite (Step 12).
+
+## Step 8 — Evidence gate design
+
+### Why a contract registry per tool rather than one mega-schema
+A single union-of-everything schema sounds tidy until you write it. The
+refund tool's required fields (ticket_id, order_id, amount, justification)
+have no overlap with a knowledge-base lookup's (query). A mega-schema
+either makes every field optional — losing all type safety, which is the
+entire point of having Pydantic in the gate — or stuffs them into a giant
+discriminated union keyed by tool_name, in which case validation errors
+become "input did not match variant X, Y, or Z" instead of "ticket_id is
+required for refund." Per-tool contracts also let each tool's owner own
+its schema: the refund team ships `RefundArgs`, the lookup team ships
+`LookupArgs`, and the registry is just plumbing. New tools register
+themselves at startup; misconfiguration (double-registration) raises
+loudly instead of silently overwriting.
+
+### Why validation errors are DENY, not REQUIRE_APPROVAL
+A malformed tool call is a deterministic failure, not a judgment call. If
+the agent forgot to pass `ticket_id`, no approver can fix that by clicking
+"approve" — the call is structurally wrong and would fail the same way on
+re-execution. Sending it to a human queue would just turn a fast feedback
+loop (agent sees DENY, retrieves the missing evidence, retries) into a
+slow one (agent stalls, human gets paged, human has no context, queue
+grows). DENY is also the only decision that lets the agent get the
+detailed error payload back in the same turn — `error_count`, `errors[]`
+with `loc`, `msg`, `type` — which is what makes the corrective retry
+possible. REQUIRE_APPROVAL is reserved for cases where the *shape* is
+right but the *meaning* warrants oversight (e.g. policy gate: refund
+amount over $500).
+
+### How this connects to the 61% → 81% task completion metric
+Two compounding effects.
+
+First, the obvious one: forcing args to validate against a real schema
+catches hallucinated calls (`amount: "fifty dollars"`, missing
+`ticket_id`) that would otherwise hit the downstream tool, fail with a
+generic tool error, and confuse the agent's recovery loop. The agent now
+sees a structured, field-level error in its next turn and can self-correct
+deterministically — "I need ticket_id" beats "tool returned 400" by a wide
+margin in the eval traces.
+
+Second, the less obvious one: a strict contract is a *contract with the
+prompt*. Once the agent knows the refund tool requires a justification
+≥10 chars, it stops trying to call refund speculatively and starts
+retrieving the ticket text first. The "I don't have enough info" failure
+mode — where the agent loops between half-formed tool calls and dead-end
+reasoning — collapses because the contract makes the missing evidence
+visible up front instead of after a tool failure. The 20pp completion lift
+in the prospective eval (Step 12) is dominated by recovering tasks that
+previously failed in this loop, not by replacing wrong-tool-call failures
+with successful ones.
+
+### Why error payloads are flattened before going into the audit log
+Pydantic's `ValidationError.errors()` entries include `input` and `ctx`
+fields that may carry references to model classes, callables, or raw
+input values that don't round-trip through JSONB. The gate's
+`_serialize_errors` keeps only `loc` (list of path components), `msg`
+(human string), and `type` (machine code). That's enough for the audit
+log to replay the decision and for the agent's next turn to know what to
+fix; the rest is noise that breaks Postgres writes the moment a tool
+passes an unusual arg.
