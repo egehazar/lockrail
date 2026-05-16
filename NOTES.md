@@ -67,3 +67,36 @@ Lockrail intercepts every tool invocation and runs:
 
 ## Open questions / TODOs
 - (fill in as we build)
+## Step 4 — Model design decisions
+
+### Why `Actor` and `ToolCall` are `frozen=True`
+Both represent immutable facts: who called what with which args. Freezing them:
+1. Makes them hashable, so they can be cache keys
+2. Prevents accidental mutation after a transaction starts
+3. Guarantees the fingerprint never drifts mid-pipeline (critical for idempotency)
+
+### Why `ToolCall.fingerprint` uses sorted-key canonical JSON
+The idempotency gate hashes (agent, tool, args) and checks Redis. If we hashed
+the args dict in insertion order, the agent calling refund(amount=100, order=X)
+vs refund(order=X, amount=100) would produce different hashes — same semantic
+call, treated as distinct. Sorting keys makes the hash semantic-equivalent.
+
+### Why `GateDecision` has 4 values, not 2
+- ALLOW: gate is satisfied
+- DENY: hard block; never proceed
+- REQUIRE_APPROVAL: soft block; pause and wait for human
+- SKIP: gate is not applicable (e.g. policy gate when no policies match)
+
+REQUIRE_APPROVAL and SKIP are critical: without REQUIRE_APPROVAL we'd have no
+human-in-the-loop story; without SKIP, every gate would have to mock-allow
+when it has nothing to say, polluting the audit log with noise.
+
+### Why `TransactionContext` is mutable but `TransactionResult` is not
+- Context flows through the pipeline, accumulating state — has to be mutable.
+- Result is the final, durable record — must be immutable so audit log
+  consumers can rely on its stability.
+
+### Why audit events have `sequence_num` in addition to `timestamp`
+Timestamps collide at sub-millisecond resolution under load. Sequence numbers
+guarantee total order within a transaction, regardless of clock skew. The
+replay engine sorts by (transaction_id, sequence_num), never by timestamp.
