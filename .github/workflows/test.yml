@@ -37,7 +37,7 @@ jobs:
           --health-retries 10
 
     env:
-      DATABASE_URL: postgresql+asyncpg://lockrail:lockrail@localhost:5432/lockrail
+      DATABASE_URL: postgresql+psycopg://lockrail:lockrail@localhost:5432/lockrail
       REDIS_URL: redis://localhost:6379/0
       LOCKRAIL_ENV: test
 
