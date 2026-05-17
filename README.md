@@ -1,5 +1,7 @@
 # Lockrail
 
+[![tests](https://github.com/egehazar/lockrail/actions/workflows/test.yml/badge.svg)](https://github.com/egehazar/lockrail/actions/workflows/test.yml)
+
 A transactional runtime that wraps every LLM-agent MCP tool call in a gate pipeline — idempotency, evidence validation, policy evaluation, human approval — before any side effect lands.
 
 [Portfolio writeup](./docs/portfolio-post.md) · [Architecture](./ARCHITECTURE.md) · [Eval methodology](./evals/README.md)
