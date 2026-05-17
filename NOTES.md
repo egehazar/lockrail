@@ -625,3 +625,40 @@ With strict Pydantic contracts via EvidenceGate, the agent gets a structured err
 
 **What would you change in v2?**
 A few things. Resume should re-evaluate gates as defense in depth. Policy DSL should be loadable from YAML so ops teams can change rules without redeploying. The approval queue needs auth — `resolver_id` is free-text right now. And the eval suite is synthetic; I'd want to run it against real production traffic to validate the metrics generalize.
+
+## Step 11 — MCP middleware
+
+### Why one Pydantic model drives both MCP inputSchema and EvidenceGate
+`ToolDefinition.args_model` is the single source of truth. `as_mcp_tools()` emits `Tool(inputSchema=args_model.model_json_schema())` and `to_contract_registry()` emits `ToolContract(args_model=args_model)`. Same class object, two surfaces.
+
+This is DRY, but that's the small reason. The big reason: any drift between the protocol schema and the validation schema *is* the bug we exist to prevent. If the MCP server advertised one shape and EvidenceGate enforced another, an agent could send args that satisfy the protocol but fail Pydantic — and the per-field error EvidenceGate formats so carefully would never reach the agent because the SDK would reject the call before the runtime touched it. Or the inverse: args that satisfy Pydantic but not the advertised schema, meaning the agent's contract-aware self-correction targets a different shape than the one Lockrail actually validates. By construction, one model means neither can happen.
+
+### Why `validate_input=False` on the SDK's `call_tool` decorator
+The MCP SDK validates input against the registered `inputSchema` before the handler runs, using jsonschema. We disable this. Two reasons:
+
+1. **EvidenceGate must own validation.** EvidenceGate's denial path produces structured `{loc, msg, type}` errors flattened for JSONB persistence and clear agent self-correction (see Step 8). jsonschema produces single-error strings like "'justification' is too short" — losing the field-level structure and the audit-replay payload. Letting the SDK reject calls first would mean the EvidenceGate code path that turns validation failures into denied transactions never gets exercised on bad calls, and the audit log loses its richest evidence rows.
+2. **Single decision point.** Two validation layers means two places to debug "why did this call get rejected." Keeping EvidenceGate as the only validator means one answer to that question.
+
+### Why a `default_actor` and what production needs
+The MVP sets `default_actor` once at server construction and stamps it onto every ToolCall. That's wrong for production — every connected agent should be a distinct actor, with at least an `agent_id` derived from the MCP transport's session identity or an authenticated principal. Stdio in particular gives us a per-process boundary that maps cleanly to a single actor, but multi-tenant deployments will need to surface authn metadata from the connection layer. This is a v2 item; the MVP is honest about it being a single-tenant assumption.
+
+### Why blocked/approval/failed responses use `isError=True` with structured content
+The agent needs to distinguish four outcomes:
+- the tool ran and here's the output
+- the tool was blocked by policy or evidence
+- the tool is waiting on a human; here's the transaction_id to resume
+- the tool exists but failed when invoked
+
+Throwing a JSON-RPC protocol error would collapse the last three into "request failed" and the agent loses its ability to choose the next step (retry with new args / abandon / wait). MCP's `CallToolResult.isError=True` with a parseable text body keeps the call a valid protocol-level result and lets us encode the structured discrimination inside the content. The body always starts with one of `unknown tool:`, `blocked by <gate>:`, `approval required:`, or the raw tool error — easy for agents to pattern-match.
+
+Unknown-tool routing is short-circuited at the MCP layer before runtime.submit. The audit log is reserved for gate decisions on real tools, not routing misses on tools that don't exist.
+
+### How this completes the resume claim
+Before Step 11, Lockrail was a library. After Step 11, Lockrail is a real MCP server. Any MCP-compliant client — Claude Desktop, LangGraph's MCP adapter, PydanticAI, custom code using the official MCP Python SDK — can connect over stdio, call `list_tools`, get the three demo tools with their JSON schemas, and invoke them through the full Idempotency → Evidence → Policy → Approval pipeline. The agent doesn't know Lockrail is there: it sees standard MCP tool calls returning standard `CallToolResult` objects. The transactional behavior is invisible at the protocol layer and visible in the audit log.
+
+### Things the MCP SDK got right and what surprised me
+The SDK's `Server.call_tool(validate_input=False)` knob was unexpectedly important — without it, a Lockrail-style runtime that wants to own validation has to fight the framework. Good that it exists.
+
+The handler-return contract is more flexible than the docs suggest. Returning `CallToolResult` directly gives full control over `isError`, `content`, and `structuredContent`. Returning a plain dict auto-wraps as `structuredContent` plus a JSON `TextContent`. We return `CallToolResult` explicitly because the dispatch on TransactionStatus needs to control `isError` per-branch.
+
+One thing that surprised me: `dir()` on a `Server` instance triggers the `request_context` property getter, which raises `LookupError` when there's no active request — so introspecting the API requires class-level (`vars(Server)`) inspection rather than `dir(instance)`. Not a Lockrail bug, but it cost a probe iteration when exploring the SDK surface.
