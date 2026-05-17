@@ -220,9 +220,9 @@ Three things matter more than the numbers:
 
 1. **Ablation per gate, no co-mingling.** Each metric removes exactly
    one gate to isolate its contribution. The exception is unsafe-writes,
-   whose baseline removes *all* gates — that matches the framing of the
-   resume claim ("Lockrail prevents 23% of unsafe writes" implies vs.
-   no Lockrail, not vs. one missing gate). The other variants are
+   whose baseline removes *all* gates — "Lockrail prevents 23% of unsafe
+   writes" is a claim about the system as a whole vs. no Lockrail, not
+   one missing gate vs. the full pipeline. The other variants are
    single-gate ablations.
 
 2. **The 61% and 81% are regression-pinned, not approximate.** A test
