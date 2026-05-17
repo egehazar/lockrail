@@ -278,7 +278,7 @@ Full output: `docs/post-assets/tests.txt`.
 
 ## Repo + demo
 
-Repo: <PLACEHOLDER — push public and replace>.
+Repo: [github.com/egehazar/lockrail](https://github.com/egehazar/lockrail).
 
 The demo script runs the full HITL approval flow end-to-end against the
 live dev stack: submit a $1,500 refund that trips the over-$500 approval
