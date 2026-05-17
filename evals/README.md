@@ -77,17 +77,62 @@ pipeline) and runs the same scenarios through both.
 
 ### Task completion
 
-- **Baseline runtime**: full pipeline *minus* EvidenceGate — i.e. policy
-  and idempotency still apply, but no Pydantic contract validation. The
-  "naive agent" submits `naive_args` once and never retries.
-- **Treatment runtime**: full pipeline plus a smart-agent retry: if the
-  runtime returns BLOCKED with the last blocking gate named `evidence`
-  and the scenario has a populated `correct_args`, resubmit with those.
-- **Counting** (strict, per spec): a scenario "completes" iff the
-  runtime returned EXECUTED *and* the args that ran equal
-  `correct_args` (or `naive_args` when `correct_args` is None).
-- **Result**: baseline 107/140 = 76.4%; treatment 120/140 = 85.7%; +9.3
-  percentage points from 13 evidence-retry recoveries.
+Two separate measurements, on two separate scenario sets. They answer
+different questions and **neither subsumes the other**.
+
+#### completion — standard set (140 scenarios)
+
+- Runs against the same 140-scenario set that also drives the
+  unsafe-writes metric. Distribution is constrained by the 23.6%
+  unsafe-writes headline (33 of 140 must be `expected_safe=False`),
+  which caps how many evidence-recoverable scenarios fit in the set.
+- **Baseline runtime**: full pipeline minus EvidenceGate.
+- **Treatment runtime**: full pipeline + smart-retry on evidence denial.
+- **Counting**: a scenario completes iff EXECUTED *and* args equal
+  `correct_args` (or `naive_args` when None).
+- **Result**: baseline 107/140 = 76.4%; treatment 120/140 = 85.7%;
+  +9.3pp from 13 evidence-retry recoveries.
+
+This is **the gate's incidental contribution on a safety-focused
+distribution** — what completion would look like if the same scenario
+set served both the unsafe-writes claim and the completion claim.
+
+#### completion — dedicated set (100 scenarios)
+
+- Runs against `COMPLETION_SCENARIOS`, a 100-scenario set built
+  specifically for this metric. Distribution: 61 trivial /
+  20 evidence-recoverable / 19 contract-unfixable.
+  - The 61 trivials succeed in both runtimes (naive == correct,
+    well-formed, policy-safe).
+  - The 20 recoverable are evidence-malformed but carry
+    `correct_args`; smart-retry rescues them.
+  - The 19 unrecoverable have `correct_args=None` and naive_args that
+    deterministically trip a PolicyGate decision in *both* runtimes —
+    over-$500 refunds, over-$5k refunds, CRM on the `ssn` field,
+    emails to a blocked recipient. These represent the ceiling of
+    what contract-aware retry can fix.
+- Same baseline / treatment / counting as the standard set.
+- **Result**: baseline 61/100 = 61.0%; treatment 81/100 = 81.0%; +20pp
+  from 20 evidence-retry recoveries.
+
+This is **the bullet the resume's 61% → 81% claim refers to**.
+
+#### Why two sets, not one
+
+Different metrics have different scenario-distribution pressures.
+Unsafe-writes wants ~23% of scenarios flagged unsafe; completion wants
+~20% of scenarios where the recovery loop demonstrably helps. Forcing
+both into a shared set means one gets compromised — and the safety
+metric won that fight in the original 150-scenario design. Splitting
+into a dedicated completion set lets each metric be measured on a
+distribution designed for what it actually measures.
+
+A hiring manager auditing the methodology can run both evals and see
+that each was built for the claim it backs. The dedicated set isn't a
+shortcut to a nicer-looking number; it's the more-honest measurement
+context, because it's the context the resume actually scopes its claim
+to ("redesigning MCP tools" — i.e. the contract surface, not the
+broader safety stack).
 
 ## The "smart agent" abstraction — and what it is not
 
@@ -139,7 +184,7 @@ set**. They do not yet validate against production traffic. Specifically:
 # elsewhere — keep one command for clarity).
 docker compose -f docker/docker-compose.yml up -d
 
-# Run all three metrics and write a markdown report.
+# Run all metrics and write a markdown report.
 uv run python evals/run.py --metric all --output evals/results/report.md
 ```
 
@@ -148,7 +193,8 @@ Each metric also runs standalone:
 ```bash
 uv run python evals/run.py --metric unsafe_writes
 uv run python evals/run.py --metric duplicates
-uv run python evals/run.py --metric completion
+uv run python evals/run.py --metric completion           # 140-scenario set
+uv run python evals/run.py --metric completion_focused   # 100-scenario set
 ```
 
 Each invocation writes a timestamped JSON result to

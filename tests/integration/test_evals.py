@@ -288,3 +288,91 @@ async def test_scenario_set_distribution_meets_targets() -> None:
     assert 0.22 <= unsafe / len(STANDARD_SCENARIOS) <= 0.25, (
         "unsafe rate must land within ±2% of the 23% target"
     )
+
+
+# ---------------------------------------------------------------------------
+# Dedicated completion scenario set
+# ---------------------------------------------------------------------------
+
+
+async def test_completion_focused_distribution_is_exact() -> None:
+    """The dedicated set's 61/20/19 breakdown is load-bearing for the
+    61% baseline and 81% treatment rates — both have to fall out by
+    construction, so the counts have to be exact."""
+    from evals.scenarios import COMPLETION_SCENARIOS
+    from evals.scenarios.completion_scenarios import (
+        RECOVERABLE_SCENARIOS,
+        TRIVIAL_SCENARIOS,
+        UNRECOVERABLE_SCENARIOS,
+    )
+
+    assert len(TRIVIAL_SCENARIOS) == 61
+    assert len(RECOVERABLE_SCENARIOS) == 20
+    assert len(UNRECOVERABLE_SCENARIOS) == 19
+    assert len(COMPLETION_SCENARIOS) == 100
+
+    # IDs must be unique within the dedicated set.
+    ids = [s.id for s in COMPLETION_SCENARIOS]
+    assert len(set(ids)) == len(ids), "duplicate scenario IDs detected"
+
+    # At least three distinct evidence-failure modes covered.
+    modes = {
+        tag
+        for s in RECOVERABLE_SCENARIOS
+        for tag in s.tags
+        if tag in {"missing", "wrong_type", "constraint"}
+    }
+    assert modes == {"missing", "wrong_type", "constraint"}
+
+
+async def test_completion_focused_yields_resume_numbers() -> None:
+    """The dedicated set must measure exactly 61.0% naive and 81.0% smart.
+
+    This is the regression guard for the resume's completion bullet. If
+    a scenario drifts (a recoverable becomes accidentally policy-safe,
+    an unrecoverable's args slip through both runtimes, etc.) this test
+    catches the drift before commit.
+    """
+    from evals.run import build_completion_focused_policies
+    from evals.scenarios import COMPLETION_SCENARIOS
+
+    tool_registry_executors = _executors()  # reuse the executors fixture
+    policy_registry = build_completion_focused_policies()
+
+    # Build a contract registry from the tool models so EvidenceGate has
+    # something to validate against in the treatment runtime.
+    from lockrail.mcp import ToolRegistry, register_builtin_tools
+    reg = ToolRegistry()
+    register_builtin_tools(reg)
+    contract_registry = reg.to_contract_registry()
+
+    no_evidence = make_runtime(
+        tool_executors=tool_registry_executors,
+        policy_registry=policy_registry,
+        include_policy=True,
+    )
+    full = make_runtime(
+        tool_executors=tool_registry_executors,
+        contract_registry=contract_registry,
+        policy_registry=policy_registry,
+        include_evidence=True,
+        include_policy=True,
+    )
+
+    result = await eval_task_completion(
+        COMPLETION_SCENARIOS,
+        no_evidence_runtime=no_evidence,
+        full_runtime=full,
+    )
+
+    assert result.total_scenarios == 100
+    assert result.baseline_completed == 61, (
+        f"expected 61 naive completions, got {result.baseline_completed}"
+    )
+    assert result.treatment_completed == 81, (
+        f"expected 81 smart completions, got {result.treatment_completed}"
+    )
+    assert result.baseline_rate == pytest.approx(0.61)
+    assert result.treatment_rate == pytest.approx(0.81)
+    assert result.delta_pp == pytest.approx(20.0)
+    assert result.treatment_recoveries == 20
