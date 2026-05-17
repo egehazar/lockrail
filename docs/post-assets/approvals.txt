@@ -1,0 +1,6 @@
+                  id                  | tool_name | status  | resolver_id |   requested_reason   
+--------------------------------------+-----------+---------+-------------+----------------------
+ 537aa2a6-dc54-41bf-9d35-8466db2b9e36 | refund    | GRANTED | ops-cli     | amount=1500 gt 500.0
+ eea9bece-0e0f-4aee-8c7b-86024230a9be | refund    | GRANTED | ops-cli     | amount=1500 gt 500.0
+(2 rows)
+

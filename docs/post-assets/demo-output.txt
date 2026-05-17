@@ -1,0 +1,28 @@
+
+--- 1. Submit a $1500 refund (over the $500 approval threshold) ---
+  status=pending_approval  tx_id=80508beb-afea-4201-864d-8bb6809d58fe
+  halted by gate='policy'  reason='amount=1500 gt 500.0'
+
+--- 2. List pending approvals (operator view) ---
+  approval=537aa2a6-dc54-41bf-9d35-8466db2b9e36  tool=refund  reason='amount=1500 gt 500.0'
+
+--- 3. Grant the approval (operator action) ---
+  status=granted  resolver=ops-cli
+
+--- 4. Resume the transaction ---
+  [executor] refunding $1500 for order ORD-42
+  status=executed  output={'refunded': True, 'amount': 1500}
+  new tx_id=8918b067-f581-47fc-9698-bdf3c2088103  resumed_from=80508beb-afea-4201-864d-8bb6809d58fe
+
+--- 5. Audit trail across both transactions ---
+Inspect with psql:
+  docker exec -it lockrail-postgres psql -U lockrail -d lockrail -c "\
+   SELECT event_type, sequence_num, payload->>'resumed_from' as resumed_from
+   FROM audit_events
+   WHERE transaction_id IN ('80508beb-afea-4201-864d-8bb6809d58fe', '8918b067-f581-47fc-9698-bdf3c2088103')
+   ORDER BY transaction_id, sequence_num"
+
+And the approval row:
+  docker exec -it lockrail-postgres psql -U lockrail -d lockrail -c "\
+   SELECT id, status, resolver_id, notes
+   FROM approvals WHERE transaction_id = '80508beb-afea-4201-864d-8bb6809d58fe'"
